@@ -3,7 +3,6 @@
 require("dotenv").config();
 
 const express = require("express");
-const cors = require("cors");
 const axios = require("axios");
 const { pool, initSchema } = require("./db");
 const { requireAuth, requireAdmin } = require("./middleware/auth");
@@ -18,26 +17,31 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============================================================
-//  MIDDLEWARE STACK
+//  CORS — manual headers, no library needed
+//  JWT auth protects routes so open CORS is safe here
 // ============================================================
-app.use(cors({
-  origin: process.env.FRONTEND_URL || "*",
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
+app.use((req, res, next) => {
+  const origin = req.headers.origin || "*";
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  // Preflight — respond immediately, do NOT continue to routes
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
 
-app.use(express.json({ limit: "5mb" })); // 5mb covers bulk Excel imports
+app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Request logger (lightweight - no external dependency)
+// Request logger
 app.use((req, _res, next) => {
-  const now = new Date().toISOString();
-  console.log(`[${now}] ${req.method} ${req.path}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
 
 // ============================================================
-//  HEALTH CHECK (Render pings this to keep the service alive)
+//  HEALTH CHECK
 // ============================================================
 app.get("/health", (_req, res) => {
   res.json({
@@ -57,10 +61,8 @@ app.use("/api/products", productRoutes);
 app.use("/api/sales", salesRoutes);
 
 // ============================================================
-//  SETTINGS ROUTES (inline - simple enough not to need a file)
+//  SETTINGS ROUTES
 // ============================================================
-
-// GET /api/settings
 app.get("/api/settings", requireAuth, async (_req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM settings LIMIT 1");
@@ -70,7 +72,6 @@ app.get("/api/settings", requireAuth, async (_req, res) => {
   }
 });
 
-// PUT /api/settings (admin only)
 app.put("/api/settings", requireAuth, requireAdmin, async (req, res) => {
   const { shop_name, shop_email, shop_phone, shop_address } = req.body;
   try {
@@ -88,46 +89,28 @@ app.put("/api/settings", requireAuth, requireAdmin, async (req, res) => {
 });
 
 // ============================================================
-//  PAYSTACK PAYMENT ROUTES
+//  PAYSTACK ROUTES
 // ============================================================
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_BASE = "https://api.paystack.co";
 
-// POST /api/payments/initialize
-// Called when customer wants to pay via Ecash (MoMo / card)
-// Body: { email, amount_ghs, cart_meta }
 app.post("/api/payments/initialize", requireAuth, async (req, res) => {
   const { email, amount_ghs, cart_meta } = req.body;
-
   if (!email || !amount_ghs) {
     return res.status(400).json({ error: "Email and amount required" });
   }
-
   try {
     const response = await axios.post(
       `${PAYSTACK_BASE}/transaction/initialize`,
       {
         email,
-        // Paystack expects amount in pesewas (GHS × 100)
         amount: Math.round(parseFloat(amount_ghs) * 100),
         currency: "GHS",
-        metadata: {
-          cart_meta,
-          operator: req.user.fullname,
-          user_id: req.user.id,
-        },
-        // Where Paystack redirects after payment
-        callback_url: `${process.env.FRONTEND_URL}/payment-callback.html`,
+        metadata: { cart_meta, operator: req.user.fullname, user_id: req.user.id },
+        callback_url: `${process.env.FRONTEND_URL || ""}`,
       },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          "Content-Type": "application/json",
-        },
-      }
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, "Content-Type": "application/json" } }
     );
-
-    // Returns { authorization_url, access_code, reference }
     res.json(response.data.data);
   } catch (err) {
     console.error("Paystack init error:", err?.response?.data || err.message);
@@ -135,30 +118,22 @@ app.post("/api/payments/initialize", requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/payments/verify/:reference
-// Called after Paystack redirects the customer back to confirm payment succeeded
 app.get("/api/payments/verify/:reference", requireAuth, async (req, res) => {
   const { reference } = req.params;
-
   try {
     const response = await axios.get(
       `${PAYSTACK_BASE}/transaction/verify/${reference}`,
-      {
-        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` },
-      }
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
     );
-
     const data = response.data.data;
-
     if (data.status !== "success") {
       return res.status(400).json({ error: "Payment not successful", status: data.status });
     }
-
     res.json({
       verified: true,
       reference: data.reference,
       amount_ghs: data.amount / 100,
-      channel: data.channel,       // mobile_money, card, bank
+      channel: data.channel,
       customer: data.customer,
     });
   } catch (err) {
@@ -167,69 +142,45 @@ app.get("/api/payments/verify/:reference", requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/payments/webhook
-// Paystack sends payment events here server-to-server (set this URL in your Paystack dashboard)
-// This is the secure backup — it fires even if the customer closes the browser
 app.post("/api/payments/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const crypto = require("crypto");
-  const hash = crypto
-    .createHmac("sha512", PAYSTACK_SECRET)
-    .update(req.body)
-    .digest("hex");
-
-  // Reject requests that didn't come from Paystack
-  if (hash !== req.headers["x-paystack-signature"]) {
-    return res.status(401).send("Invalid signature");
-  }
-
+  const hash = crypto.createHmac("sha512", PAYSTACK_SECRET).update(req.body).digest("hex");
+  if (hash !== req.headers["x-paystack-signature"]) return res.status(401).send("Invalid signature");
   const event = JSON.parse(req.body);
-
   if (event.event === "charge.success") {
-    const { reference, metadata } = event.data;
-    console.log(`✅ Webhook: Payment confirmed — ref: ${reference}`);
-    // If you want to auto-finalize sales from webhooks, add logic here.
-    // For now the frontend verify route handles this flow.
+    console.log(`Webhook: Payment confirmed — ref: ${event.data.reference}`);
   }
-
-  res.sendStatus(200); // Always respond 200 fast so Paystack doesn't retry
+  res.sendStatus(200);
 });
 
 // ============================================================
-//  GLOBAL ERROR HANDLER
+//  ERROR HANDLERS
 // ============================================================
 app.use((err, _req, res, _next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ error: "Internal server error" });
 });
 
-// 404 catch-all
 app.use((_req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
 
 // ============================================================
-//  BOOT SEQUENCE
+//  BOOT
 // ============================================================
 async function start() {
   try {
-    // 1. Verify database connection
     await pool.query("SELECT 1");
     console.log("Database connection established");
-
-    // 2. Run schema migrations (safe - uses IF NOT EXISTS)
     await initSchema();
-
-    // 3. Start HTTP server
     app.listen(PORT, () => {
       console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
       console.log("  Admia SaaS Backend — Node Engine Online");
-      console.log(`  Godspeed Innovations Group`);
-      console.log(`  Port   : ${PORT}`);
-      console.log(`  Env    : ${process.env.NODE_ENV || "development"}`);
+      console.log(`  Port: ${PORT} | Env: ${process.env.NODE_ENV || "development"}`);
       console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     });
   } catch (err) {
-    console.error("❌ Failed to start server:", err.message);
+    console.error("Failed to start server:", err.message);
     process.exit(1);
   }
 }
