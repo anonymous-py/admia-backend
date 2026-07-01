@@ -7,9 +7,10 @@ const pool = new Pool({
 });
 
 async function initSchema() {
+  // ⚠️ TEMPORARY: wipe stale/incompatible tables from before the multi-tenant switch.
+  // Remove this block after your first successful clean boot.
   await pool.query(`
-
-    -- ── TENANTS ────────────────────────────────────────────────────────
+        -- ── TENANTS ────────────────────────────────────────────────────────
     -- One row per shop/business that subscribes to Admia SaaS
     CREATE TABLE IF NOT EXISTS tenants (
       id               SERIAL PRIMARY KEY,
@@ -96,7 +97,10 @@ async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_products_tenant  ON products(tenant_id);
     CREATE INDEX IF NOT EXISTS idx_sales_tenant     ON sales(tenant_id);
     CREATE INDEX IF NOT EXISTS idx_users_tenant     ON users(tenant_id);
+  
+
   `);
+
 
   console.log("Multi-tenant schema ready");
 }
